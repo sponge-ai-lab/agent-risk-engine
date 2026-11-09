@@ -62,9 +62,8 @@ The checks below borrow from controls that already exist elsewhere: broker pre-t
 - Buyer and seller addresses are checked against a sanctions screening result before a hold. The engine consumes the result from a screening provider; it does not screen on its own.
 
 **8. Across the network**
-*Precedent: concentration limits and stress testing in clearing houses.*
+*Precedent: concentration limits in clearing houses; kill switches in broker pre-trade controls.*
 - No single seller, verifier or asset holds too large a share of all open funds.
-- A stress view reports the loss if the largest sellers or verifiers failed at once.
 - A kill switch pauses a seller, agent, verifier, asset or whole rail immediately.
 
 ## What we track after a hold
