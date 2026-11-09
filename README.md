@@ -108,3 +108,7 @@ The checks below borrow from controls that already exist elsewhere: broker pre-t
 - [eBay payments for new sellers](https://pages.ebay.com.sg/pay/help/index.html)
 - [Halborn, x402 security risks and controls](https://www.halborn.com/blog/post/x402-explained-security-risks-and-controls-for-http-402-micropayments) and [CSA research note on x402 SDK flaws](https://labs.cloudsecurityalliance.org/research/csa-research-note-x402-agent-payment-sdk-flaws-20261025-csa/)
 - [Elliptic, sanctions screening in crypto](https://www.elliptic.co/sanctions-guide-gate.html)
+
+## License
+
+[Apache-2.0](./LICENSE)
