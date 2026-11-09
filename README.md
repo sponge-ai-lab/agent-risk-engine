@@ -1,103 +1,66 @@
 # agent-risk-engine
 
-Settlement-side risk checks for agent payments: exposure, limits and velocity across every open hold, on any payment rail.
+Risk checks that run before an agent payment is held in escrow, on any payment rail.
 
-> **Status: design.** This repository holds the design only; no code yet.
+> **Status: design.** No code yet.
 
-## What we are building
+## What it does
 
-A small C++ engine that the settlement layer asks one question before it locks any money:
+- Before any money is locked, the settlement layer (for example [Misa](https://trymisa.com)) asks: **"Is it safe to hold this payment?"**
+- The engine answers **allow**, or **deny with a reason** (for example `SELLER_EXPOSURE_LIMIT`).
+- It keeps an in-memory view of every open hold, across all agents, sellers, verifiers, assets and rails.
+- It never holds, signs or moves funds.
 
-> **"Is it safe to hold this payment?"**
+## What we check before every hold
 
-It answers **allow** or **deny, with a reason**, in microseconds, from an in-memory view of every open hold. It never touches funds: custody, signing and settlement stay with the rail.
+**The request itself**
+- The asset is supported, and the amount is positive and within the per-payment cap.
+- The order is new: the same order ID cannot be held twice.
+- The hold deadline is neither too short to deliver nor too long (funds locked for days).
 
-### Example
+**The buyer (agent)**
+- Total held for this agent stays under its limit, per asset (for example, at most 500 XRP).
+- Total held across all assets stays under its limit in USD (for example, at most $1,000).
+- Order rate stays normal (for example, at most 20 orders per minute).
 
-An agent asks to buy a dataset for 40 USDC from seller `S`, verified by arbiter `A`. Before the escrow is created, [Misa](https://trymisa.com) calls the engine:
+**The seller**
+- Total held for this seller stays under its limit (for example, at most 10,000 USDC).
+- New sellers get lower limits until they have a delivery record.
+- Sellers whose deliveries often fail verification get lower limits or are paused.
+- A sudden burst of new buyers is flagged (for example, more than 200 per minute), even when each buyer is within its own budget.
 
-```
-check(agent=agent_42, seller=S, verifier=A, asset=USDC on Base, amount=40)
-```
+**The verifier (arbiter)**
+- Total held waiting on one verifier stays under its limit, so an outage cannot freeze too much money.
+- A verifier that is slow or missing deadlines stops receiving new holds.
 
-The engine looks at what is already held and replies:
+**Across the network**
+- No single seller or verifier holds too large a share of all open funds.
+- Prices used for USD limits are fresh; a stale price means deny, never a guess.
 
-```
-deny: SELLER_EXPOSURE_LIMIT
-  seller S already has 9,980 USDC held across 312 open escrows; limit is 10,000
-```
+## What we track after a hold
 
-No wallet could have caught this: each of those 312 escrows came from a different agent, and each one was within its own budget.
+- **Authorized:** the amount is added to buyer, seller and verifier exposure.
+- **Captured:** the seller was paid; exposure is released and the seller's delivery record improves.
+- **Reclaimed or voided:** the buyer was refunded; exposure is released and counts against the seller.
+- **Expired:** the deadline passed; the hold is queued for reclaim and stops counting toward limits.
+- The same event applied twice changes nothing, and replaying the event log rebuilds the same state.
 
-## Why the settlement layer, not the wallet
+## How it handles different assets and rails
 
-An agent wallet enforces its owner's budget: how much *this* agent may spend. It cannot see other agents, sellers or rails. The settlement layer holds the payments, so it is the one place that sees all of them at once.
+- Each asset is identified by network and asset, as in x402 (`xrpl:0` / `XRP`, `eip155:8453` / USDC, `stripe` / `usd`).
+- Amounts are integers in each asset's smallest unit (drops, cents, wei), stored as 128-bit values. Different assets are never added directly.
+- USD totals use a price feed with a haircut per asset (for example, XRP counted at 80% of its price).
+- Each rail has a small adapter that turns its events (XRPL `EscrowCreate`, an EVM authorization, a Stripe manual-capture payment) into the events above.
 
-| | Analogy | Question it answers | Sees |
-| --- | --- | --- | --- |
-| Agent wallet | A broker's pre-trade checks for one client | "May my agent make this payment?" | One agent |
-| **This engine** | A clearing house's risk management | "Is it safe to hold and settle this payment?" | Every agent, seller, verifier and rail |
+## What it does not do
 
-The engine does not replace wallet budgets. It can enforce simple buyer budgets for agents without a policy-aware wallet, but its main job is the risk no single wallet can see.
-
-## Checks
-
-| Check | Example rule | What it protects against |
-| --- | --- | --- |
-| **Seller exposure** | At most 10,000 USDC held for one seller | A fraudulent or failing seller taking many buyers down at once |
-| **Verifier exposure** | At most $50,000 of holds waiting on one arbiter | An arbiter outage freezing a large share of open payments |
-| **Buyer exposure** | At most 500 XRP held for one agent | Runaway agents; budgets for agents without smart wallets |
-| **Aggregate exposure** | At most $1,000 per agent across all assets, priced conservatively | Spreading spend across assets to dodge per-asset limits |
-| **Velocity** | At most 20 orders per agent per minute; at most 200 new buyers per seller per minute | Loops, scripted abuse, coordinated attacks on one seller |
-| **Expiry** | Holds past their deadline leave exposure and are queued for reclaim | Funds staying locked, and limits being consumed by dead holds |
-
-Every rule is configuration, not code. Which rules apply, and their thresholds, belong to the operator (for Misa, private product configuration).
-
-## Model
-
-- **Assets** are identified by network and asset, as in x402: CAIP-2 networks such as `xrpl:0` or `eip155:8453`, or `stripe` for card rails. Each asset has its own decimals.
-- **Amounts** are integers in an asset's smallest unit (drops, cents, wei), stored as 128-bit values so 18-decimal assets fit. Amounts of different assets are never added directly.
-- **Aggregate limits** convert to a reference currency through a price feed, with a haircut per asset (for example, XRP counted at 80% of its price). A stale price means deny, never a guess.
-- **Events** are rail-agnostic and follow the x402 `auth-capture` lifecycle. Each rail has an adapter that translates its own events:
-
-| Event | Exposure | XRPL | EVM | Stripe |
-| --- | --- | --- | --- | --- |
-| `Authorized` | + amount | `EscrowCreate` | authorize | manual-capture PaymentIntent |
-| `Captured` | − amount (paid to seller) | `EscrowFinish` | capture | capture |
-| `Reclaimed` / `Voided` | − amount (back to buyer) | `EscrowCancel` | reclaim / void | cancel |
-| `Expired` | marked for reclaim | past `CancelAfter` | past deadline | authorization expired |
-
-- **State is derived from events.** Replaying the settlement event log rebuilds the exact same state, so a restart or a second instance needs no separate database. Applying the same event twice has no effect.
-
-## Shape
-
-```
-rail adapters (XRPL, EVM, Stripe) -> events -> risk core (C++) -> allow / deny + reason
-                                                    ^
-                     x402 hooks (TypeScript) -------+
-                     onBeforePaymentCreation, onBeforeVerify, onBeforeSettle
-```
-
-- **Core:** a C++20 library with no dependency on any rail or protocol. It is exposed as a small service later.
-- **Adapters:** thin TypeScript glue that calls the core from x402 hooks and from Misa's settlement engine.
-
-## Non-goals
-
-- Holding, signing or moving funds
-- Fraud scoring with machine learning (the engine applies explicit rules; a model can feed it signals later)
-- Replacing wallet-side budgets and allowlists
+- Hold, sign or move funds.
+- Replace wallet budgets: a wallet limits one agent, while this engine sees risk across all of them.
+- Score fraud with machine learning; it applies explicit rules, and thresholds are configuration.
 
 ## Roadmap
 
-| Milestone | Delivers | Done when |
-| --- | --- | --- |
-| **1. Core** | Exposure book per (account, asset), per-asset limits, expiry queue, `check()` and `apply(event)` | Unit tests cover every event type, limit boundaries and duplicate events |
-| **2. Replay and benchmarks** | Rebuild from an event log; velocity windows; aggregate limits with a price feed | Replayed state equals live state; p50/p99 latency per `check()` published here |
-| **3. Service** | HTTP or gRPC interface; Misa calls it before each hold | Misa denies a payment with a reason from the engine on testnet |
-| **4. x402 adapters** | TypeScript hooks for buyers, resource servers and facilitators | An x402 client or server can add the engine with one hook |
-
-## Open questions
-
-- Should a deny be final, or should some reasons allow a smaller amount (partial approval)?
-- How should limits behave when a verifier is slow but not down?
-- Which price feed, and how stale may a price be before aggregate checks deny?
+1. **Core (C++20):** exposure per account and asset, limits, expiry queue, `check()` and `apply(event)`, unit tests.
+2. **Replay and benchmarks:** rebuild from an event log, rate windows, USD limits, p50/p99 latency per check.
+3. **Service:** an HTTP or gRPC interface that Misa calls before each hold.
+4. **x402 adapters:** TypeScript hooks (`onBeforePaymentCreation`, `onBeforeVerify`, `onBeforeSettle`).
